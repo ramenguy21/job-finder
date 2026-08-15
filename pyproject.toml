@@ -1,0 +1,14 @@
+[project]
+name = "gigbot"
+version = "0.1.0"
+description = "RSS job feed watcher that pushes matches to Telegram"
+requires-python = ">=3.12"
+dependencies = [
+    "feedparser>=6.0.11",
+    "httpx>=0.27.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6.0",
+]

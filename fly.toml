@@ -1,0 +1,21 @@
+# Rename `app` to something unique before deploying.
+app = "gigbot"
+primary_region = "bom"   # Mumbai. Any region works, it's outbound-only.
+
+[build]
+
+# SQLite lives here. Without this the DB resets on every deploy and you get
+# re-notified about every posting.
+[mounts]
+  source = "gigbot_data"
+  destination = "/data"
+
+[env]
+  DB_PATH = "/data/seen.db"
+  POLL_INTERVAL = "1800"
+
+# No [http_service] block: this app listens on nothing. That also means Fly
+# will not autostop it, which is what we want for a sleep-loop process.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
