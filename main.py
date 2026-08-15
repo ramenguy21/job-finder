@@ -70,6 +70,9 @@ DB_PATH = os.environ.get("DB_PATH", "./seen.db")
 TG_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "1800"))
+# Unset means no listener at all, which is the right default for a local run.
+# fly.toml sets it, because Fly needs something bound to internal_port.
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "0") or 0)
 
 # Reddit 403s the default python user-agent.
 UA = "gigbot/0.1 (personal job feed reader)"
@@ -993,6 +996,23 @@ def main() -> None:
         if args.once:
             run_once(conn, client)
             return
+
+        # Read-only corpus viewer on a daemon thread. Imported here rather than
+        # at module scope because dashboard.py imports this module for its
+        # matchers - a top-level import either way round is a cycle. By the
+        # time main() runs, this module is fully initialised, so the deferred
+        # import resolves cleanly.
+        #
+        # Wrapped because the dashboard is an accessory: a port already in use,
+        # or a permissions problem binding it, must not stop the watcher from
+        # doing the one thing it exists to do.
+        if DASHBOARD_PORT:
+            try:
+                import dashboard
+
+                dashboard.serve_in_background(DASHBOARD_PORT, DB_PATH)
+            except Exception:
+                log.exception("dashboard failed to start, continuing without it")
 
         # Boot ping. Without it a deployment where the credentials are missing
         # is indistinguishable from a healthy one: send_telegram() logs and

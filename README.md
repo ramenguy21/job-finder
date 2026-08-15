@@ -29,11 +29,21 @@ hundred messages at once. Run it twice to see real behaviour.
 fly launch --no-deploy --copy-config   # pick a unique app name
 fly volumes create gigbot_data --size 1 --region bom
 fly secrets set TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...
+fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)
 fly deploy
 fly logs
 ```
 
 Roughly $2/month for a shared-cpu-1x machine plus a 1GB volume.
+
+The machine serves the corpus dashboard on its public hostname. Open
+`https://<app>.fly.dev/?t=<DASHBOARD_TOKEN>` once — that sets a cookie, and the
+bare URL works afterwards. Without the secret the server answers 503 rather
+than publishing every posting it has collected to a guessable hostname.
+
+Keep `auto_stop_machines = 'off'` in `fly.toml`. This is a poll loop, not a web
+app: if Fly stops the machine because nobody is loading the dashboard, it stops
+watching the feeds too, and nothing tells you.
 
 Note: a volume is tied to one machine. Keep this at a single instance
 (`fly scale count 1`). Two machines would each get their own volume, their own
@@ -82,6 +92,22 @@ uv run python backtest.py --replay   # send the matches you missed
 
 Tune `MUST_HAVE` / `EXCLUDE` in `config.py`, re-run, repeat. No waiting for
 new postings.
+
+## The dashboard
+
+```bash
+uv run python dashboard.py --open     # dashboard.html, opens in a browser
+uv run python dashboard.py --serve    # http://localhost:8080 instead
+```
+
+The same corpus as `backtest.py`, as one self-contained HTML page: the filter
+funnel, per-source match rates, geo tiers, stack-term frequency across matched
+postings, and a vocabulary audit showing which `config.py` terms never fire at
+all. Filters at the top scope every chart at once.
+
+Every verdict on the page is recomputed from the current `config.py`, not read
+from the database — edit a vocabulary, re-render, see the effect. It opens the
+DB read-only and never writes to it.
 
 ## Verifying feeds
 

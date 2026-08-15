@@ -12,9 +12,12 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 # backtest.py and verify_feeds.py are here for `fly ssh console`: --replay is
 # the only way to recover a send that failed, and a dead feed is silent
-# without verify_feeds.
-COPY main.py config.py backtest.py verify_feeds.py ./
+# without verify_feeds. dashboard.py is not a console tool - main.py imports it
+# to serve the corpus on DASHBOARD_PORT, so it must be in the image.
+COPY main.py config.py dashboard.py backtest.py verify_feeds.py ./
 RUN uv sync --frozen --no-dev
+
+EXPOSE 8080
 
 # The venv interpreter directly, not `uv run`. `uv run` re-resolves the
 # lockfile at container start - it was downloading ruff (10MB, dev group) on

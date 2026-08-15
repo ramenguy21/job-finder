@@ -20,6 +20,8 @@ the Telegram API.
 | Filtering (4-stage) | working, rebuilt and measured against the corpus |
 | Geo tiering | working, rebuilt and measured against the corpus |
 | Telegram delivery | **blocked by ISP locally — see below** |
+| Dashboard (`dashboard.py`) | working, rendered and checked in both themes |
+| Dashboard over HTTP on Fly | wired and tested locally, **never deployed** |
 | Fly deployment | config written, never deployed |
 | RemoteOK / Remotive JSON URLs | **verified, both 200** |
 | Reddit feeds | **mostly 403 Blocked** |
@@ -33,8 +35,10 @@ main.py           ~660 lines. Everything: fetch, filter, classify, send.
 config.py         ~215 lines. Feed list + keyword vocabularies. Edit this.
 backtest.py       ~140 lines. Tune filters against the stored corpus.
 verify_feeds.py    ~60 lines. Check feeds resolve and see match rates.
+dashboard.py      ~900 lines. The corpus as one self-contained HTML page,
+                        mostly template. Read-only. Also serves itself.
 Dockerfile              uv-based build.
-fly.toml                Single machine + volume at /data.
+fly.toml                Single machine + volume at /data + the dashboard.
 seen.db                 SQLite. Gitignored. This is all the state there is.
 ```
 
@@ -221,10 +225,48 @@ except `geo_blocked` when `DROP_GEO_BLOCKED = True` (currently `False`).
 
 ---
 
+## The dashboard
+
+`dashboard.py` renders the corpus to one self-contained HTML file — no CDN, no
+charting library, no network access at all, so it opens over `file://`. Every
+verdict on it is recomputed live through `main.match_reason()` and
+`main.classify_geo()`, never read from the stored `geo_tier` / `notify_state`.
+Edit a vocabulary, re-render, see the effect. It is `backtest.py` with a
+browser: the filter funnel is `--stages`, the postings table is `--why`.
+
+What it answers that the terminal did not:
+
+- **Which feeds earn their requests.** `r/forhire` is 135 rows and 5 matches;
+  `wwr:backend` is 27 rows and 18. Both cost the same in the poll loop.
+- **Which feeds contribute nothing at all.** A feed with zero rows cannot
+  appear in a per-source table, so the scorecard diffs the corpus against
+  `config.FEEDS` and names the difference. That is the "a dead feed is silent"
+  gotcha, finally visible.
+- **Which vocabulary terms are dead weight.** Corpus-wide firing counts per
+  term, per list, plus the terms that never fire. `frappe` fires on 38
+  postings and appears in zero matches — worth a look before the next
+  `STACK` edit.
+
+On Fly, `main.py` starts it on a daemon thread when `DASHBOARD_PORT` is set,
+and `[http_service]` routes to it. Two things guard it:
+
+- **`DASHBOARD_TOKEN` or nothing.** No token, no page — 503, not an open door.
+  `fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)`, then hit
+  `/?t=<token>` once to set a cookie. The hostname is public and guessable and
+  the page embeds every posting in the corpus.
+- **Read-only, cached, daemon thread.** It opens SQLite with `mode=ro`, caches
+  the rendered body for 120s or until the DB file changes, and cannot keep the
+  process alive. A render is ~2s of regex over the whole corpus; without the
+  cache, a held refresh key would pin the one shared CPU the watcher runs on.
+
+---
+
 ## Next steps, roughly ordered
 
 1. Deploy to Fly and confirm Telegram delivers from there. Everything else is
-   downstream of that one unknown.
+   downstream of that one unknown. Confirm the dashboard answers on
+   `https://gigbot.fly.dev/?t=<token>` in the same pass — it is the fastest
+   check that the volume mounted and the corpus is where it should be.
 2. `--replay` the backlog once delivery is confirmed.
 3. Watch `fly logs` for a day.
 4. Decide on Reddit: PRAW/OAuth, or drop the nine feeds and lean on WWR +
@@ -253,6 +295,12 @@ also where scope creep lives — the ugly version is the one that finds the job.
   them, query by `ingested_at` and `geo_tier` rather than by `notified`.
   A backlog you can never clear is worse than one you have to SELECT.
 - Feed failures are logged and skipped, never fatal. A dead feed is silent —
-  run `verify_feeds.py` periodically.
-- `fly.toml` has no `[http_service]`. Intentional: nothing listens.
+  run `verify_feeds.py` periodically. The dashboard's source scorecard now
+  names any feed in `FEEDS` with zero rows, which is the cheapest way to
+  notice.
+- `fly.toml` used to be described here as having no `[http_service]`. It always
+  did — `fly launch` wrote one — and it was set to `auto_stop_machines = 'stop'`
+  with `min_machines_running = 0`. Nothing listened on 8080, so Fly was free to
+  stop an idle machine and silently stop the polling with it. That is now
+  `'off'` / `1`, and the dashboard is what listens.
 - A full local cycle takes ~7 minutes, almost all of it Reddit backoff.

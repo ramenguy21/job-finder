@@ -18,9 +18,12 @@ uv run python backtest.py --rejected --why
 uv run python backtest.py --stages    # rejection counts per filter stage
 uv run python backtest.py --reclassify   # after editing geo vocabularies
 uv run python verify_feeds.py         # check feeds resolve, see match rates
+uv run python dashboard.py --open     # render the corpus to dashboard.html
+uv run python dashboard.py --serve    # ...over HTTP instead, like Fly does
 ```
 
-Env: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `DB_PATH`, `POLL_INTERVAL`.
+Env: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `DB_PATH`, `POLL_INTERVAL`,
+`DASHBOARD_PORT`, `DASHBOARD_TOKEN`.
 `main.py` loads `.env` at import via `load_dotenv()`; real environment
 variables take precedence, so Fly is unaffected. Without a token,
 `send_telegram()` logs instead of sending — that is a valid local-dev path,
@@ -62,6 +65,13 @@ paragraph nine is a hard no.
 
 **Never notify without inserting first.** Entries are written to `seen`
 before any filtering. The corpus has value independent of notifications.
+
+**The dashboard is a viewer and opens the DB read-only.** `dashboard.py`
+recomputes every verdict from `config.py` rather than reading the stored
+`geo_tier` / `notify_state` — editing a vocabulary and reloading shows the
+effect. It must never migrate, reclassify or prune; `backtest.py --reclassify`
+stays the only writer. It also serves nothing without `DASHBOARD_TOKEN`: the
+Fly hostname is public and the page embeds the whole corpus.
 
 **Keep dedupe conservative.** `title_hash` strips bracketed tags only.
 Aggressive normalization drops real leads.

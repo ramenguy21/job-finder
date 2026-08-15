@@ -8,18 +8,36 @@ primary_region = "ams"
 [env]
   DB_PATH = '/data/seen.db'
   POLL_INTERVAL = '1800'
+  # main.py serves the read-only corpus dashboard here. Must equal
+  # http_service.internal_port below, or Fly routes to a closed port.
+  DASHBOARD_PORT = '8080'
 
 [[mounts]]
   source = 'gigbot_data'
   destination = '/data'
 
+# The dashboard is the only thing that listens. Reaching it needs
+# DASHBOARD_TOKEN, which is a secret, not an env var:
+#
+#   fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)
+#   open https://gigbot.fly.dev/?t=<token>     # sets a cookie, then / works
+#
+# Without the secret the server answers 503 rather than publishing every
+# posting in the corpus on a guessable hostname.
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'stop'
+  # Both of these were 'stop' / 0 from `fly launch`, which is correct for a web
+  # app and wrong for a watcher: Fly stops an idle machine when nothing is
+  # requesting it, and this process is a poll loop that must keep running
+  # whether or not anyone opens the dashboard. Stopping it also suppresses
+  # notifications silently - the machine simply is not there to poll.
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ['app']
+  # Single instance only. The volume binds to one machine; `scale count 2`
+  # gives two independent databases and duplicate notifications.
 
 [[vm]]
   size = 'shared-cpu-1x'
