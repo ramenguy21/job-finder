@@ -613,6 +613,49 @@ def parse_json_jobs(payload: bytes, source: str) -> list:
     return entries
 
 
+URL_IN_TEXT_RE = re.compile(r"https?:\s*//")
+
+
+def parse_mastodon(payload: bytes, source: str) -> list:
+    """Mastodon hashtag RSS. Valid RSS, but with no <title> on any item.
+
+    The whole post lives in <description>; feedparser yields title="". That
+    is fatal here rather than cosmetic, because stages 1 and 2 of the filter
+    read the title only - so every entry died at TITLE_ROLE. Measured before
+    this function existed: 0 of 20 passed, on all of mastodon.social,
+    fosstodon.org and hachyderm.io.
+
+    So synthesize a title from the opening of the post. Mastodon renders links
+    with a space after the scheme ("https:// example.com/..."), and the human
+    sentence almost always precedes the link, so cutting at the first URL
+    gives a clean headline. Everything is still kept in the body for the STACK
+    and geo stages.
+    """
+    parsed = feedparser.parse(payload)
+    entries = []
+    for entry in parsed.entries:
+        body = strip_html(entry.get("summary") or entry.get("description") or "")
+        if not body:
+            continue
+
+        head = URL_IN_TEXT_RE.split(body)[0].strip()
+        # A post that opens with a bare link leaves nothing to cut; fall back
+        # to a prefix of the body rather than dropping the entry.
+        title = (head or body)[:180].strip()
+
+        entries.append(
+            {
+                "id": entry.get("id") or entry.get("link"),
+                "title": title,
+                "summary": body,
+                "link": entry.get("link", ""),
+                "published_parsed": entry.get("published_parsed"),
+                "_epoch": None,
+            }
+        )
+    return entries
+
+
 HN_ITEM_URL = "https://hn.algolia.com/api/v1/items/{}"
 HN_COMMENT_URL = "https://news.ycombinator.com/item?id={}"
 
@@ -707,6 +750,9 @@ def fetch_feed(client: httpx.Client, source: str, url: str, kind: str) -> list:
 
     if kind == "json":
         return parse_json_jobs(payload, source)
+
+    if kind == "mastodon":
+        return parse_mastodon(payload, source)
 
     parsed = feedparser.parse(payload)
     if parsed.entries:

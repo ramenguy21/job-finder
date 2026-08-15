@@ -53,6 +53,25 @@ FEEDS = [
     # Jobicy. Smaller, remote-only, carries a structured `jobGeo`.
     ("jobicy", "https://jobicy.com/api/v2/remote-jobs?count=50", "json"),
 
+    # Mastodon hashtag timelines. Valid RSS, but items carry no <title> - the
+    # whole post is in <description> - so they need parse_mastodon() to
+    # synthesize one. Without it every entry dies at TITLE_ROLE; measured at
+    # 0 of 20 before the adapter existed.
+    #
+    # Tags chosen by measurement, not by guessing. Match counts out of 20:
+    #   jobsearch 9   hiring 4   rustjobs 3/9
+    #   python 3      - excluded, "PEP 839: ... C API" matches via `api`
+    #   hiringnow, getfedihired, techjobs, jobs, remotework, golang,
+    #   javascript, webdev - all 0
+    #
+    # One instance only. mastodon.social, fosstodon.org and hachyderm.io all
+    # returned the same lead item: federated timelines overlap almost
+    # completely, so polling several is duplicate work at triple the requests.
+    # #hiring is largely a subset of #jobsearch and is kept only for drift.
+    ("masto:jobsearch", "https://mastodon.social/tags/jobsearch.rss", "mastodon"),
+    ("masto:hiring", "https://mastodon.social/tags/hiring.rss", "mastodon"),
+    ("masto:rustjobs", "https://mastodon.social/tags/rustjobs.rss", "mastodon"),
+
     # Hacker News "Ask HN: Who is hiring?" - one thread a month, 500-800
     # top-level comments, each one a posting in a rigid pipe-delimited format
     # the existing filters read natively. Remote-heavy and startup-heavy.
@@ -91,6 +110,9 @@ FEEDS = [
 HOST_MIN_INTERVAL = {
     "www.reddit.com": 5.0,
     "reddit.com": 5.0,
+    # Three tag feeds off one volunteer-run instance. Nothing has rate-limited
+    # us here; this is politeness, not a fix for an observed 429.
+    "mastodon.social": 2.0,
 }
 DEFAULT_MIN_INTERVAL = 0.5
 
@@ -181,6 +203,12 @@ EXCLUDE_TITLE = [
     "wordpress", "shopify", "webflow", "wix", "squarespace", "godaddy",
     "for hire", "seeking work", "looking for work", "available for work",
     "my portfolio", "hire me",
+    # The fediverse's job-seeking hashtag. Mastodon surfaced candidates
+    # advertising themselves ("I'm looking for a Rust job", "time to find my
+    # next .NET development role") which read as engineering roles and passed
+    # every stage. They phrase it too many ways to enumerate, but they all tag
+    # it, so the tag is the reliable marker.
+    "getfedihired",
 ]
 
 # Stage 3b. Matched against TITLE + BODY. Any hit kills the entry.
