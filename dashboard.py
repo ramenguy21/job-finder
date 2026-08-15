@@ -869,6 +869,43 @@ open.</p>
 cookie and the bare URL works from then on.</p>
 </body>"""
 
+# What the 401 actually says, per way the credential arrived. The previous
+# version was the single word "unauthorized", which is true and useless: it
+# cannot tell "you opened the bare URL and have never presented a token" apart
+# from "your cookie is left over from a token you rotated", and the fixes
+# differ.
+_401_CAUSE = {
+    "none": "You have not presented a token. The bare URL only works after a "
+            "visit with <code>?t=</code> has set the cookie.",
+    "query": "The token in the URL does not match <code>DASHBOARD_TOKEN</code> "
+             "on the server. Check for a truncated paste, a stale value, or a "
+             "shell that expanded the command substitution differently than "
+             "you expected - <code>fly secrets list</code> shows when it was "
+             "last set, and <code>fly logs</code> shows the server restarting "
+             "after it changed.",
+    "cookie": "Your cookie does not match the current <code>DASHBOARD_TOKEN</code>. "
+              "That is what a rotated token looks like. Visit with "
+              "<code>?t=&lt;new-token&gt;</code> again to replace it.",
+    "bearer": "The <code>Authorization: Bearer</code> value does not match "
+              "<code>DASHBOARD_TOKEN</code>.",
+}
+
+
+def unauthorized_page(how: str) -> bytes:
+    return (
+        """<!doctype html><meta charset="utf-8">
+<title>gigbot</title>
+<body style="font:15px/1.6 system-ui,sans-serif;max-width:34em;margin:14vh auto;padding:0 6vw">
+<h1 style="font-size:17px">Unauthorized</h1>
+<p>""" + _401_CAUSE.get(how, _401_CAUSE["none"]) + """</p>
+<p>Open <code>/?t=&lt;token&gt;</code> once. It redirects to <code>/</code> and sets a
+cookie, so the token stops riding in the URL bar.</p>
+<p style="color:#666">Setting a token with a <code>+</code> or <code>=</code> in it
+is fine - both spellings are accepted - but <code>openssl rand -hex 24</code>
+avoids the question entirely.</p>
+</body>"""
+    ).encode("utf-8")
+
 
 class Handler(BaseHTTPRequestHandler):
     """Two routes and a token. Anything more belongs in a different project."""
@@ -898,22 +935,53 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _token_ok(self, query: str) -> tuple[bool, bool]:
-        """(authorised, came_from_query). Constant-time, three ways to present it."""
+    def _token_ok(self, query: str) -> tuple[bool, bool, str]:
+        """(authorised, came_from_query, how_it_was_presented).
+
+        The third value exists only so the 401 page can tell you *which* thing
+        is wrong. A bare "unauthorized" cannot distinguish "you never presented
+        a token" from "your cookie is from a token you have since rotated", and
+        those have different fixes.
+        """
         want = os.environ.get("DASHBOARD_TOKEN", "")
         if not want:
-            return False, False
-        given = parse_qs(query).get("t", [""])[0]
-        if given:
-            return hmac.compare_digest(given, want), True
+            return False, False, "none"
+
+        # Both spellings of the query value. parse_qs applies form decoding, so
+        # a "+" in the token arrives as a space and "=" padding is eaten - which
+        # silently 401s every base64 token while hex ones work. Comparing the
+        # raw value too costs nothing and removes the whole class of mystery.
+        decoded = parse_qs(query).get("t", [""])[0]
+        raw = ""
+        for pair in query.split("&"):
+            key, _, val = pair.partition("=")
+            if key == "t":
+                raw = val
+                break
+        if decoded or raw:
+            ok = (hmac.compare_digest(decoded, want)
+                  or hmac.compare_digest(raw, want))
+            return ok, True, "query"
+
         auth = self.headers.get("Authorization", "")
         if auth.startswith("Bearer "):
-            return hmac.compare_digest(auth[7:], want), False
+            return hmac.compare_digest(auth[7:], want), False, "bearer"
         for part in (self.headers.get("Cookie") or "").split(";"):
             name, _, val = part.strip().partition("=")
             if name == COOKIE:
-                return hmac.compare_digest(val, want), False
-        return False, False
+                return hmac.compare_digest(val, want), False, "cookie"
+        return False, False, "none"
+
+    def _is_https(self) -> bool:
+        """Whether the *browser* reached us over TLS.
+
+        Fly terminates TLS at the edge and forwards plain HTTP to the machine,
+        so the socket is never TLS and X-Forwarded-Proto is the only truth
+        available. This decides the cookie's Secure flag: mandatory on Fly,
+        and fatal on a plain-http localhost, where Safari drops a Secure cookie
+        outright and every reload after the redirect comes back 401.
+        """
+        return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
 
     def do_GET(self) -> None:
         path, _, query = self.path.partition("?")
@@ -929,16 +997,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(503, LOCKED_PAGE)
             return
 
-        ok, from_query = self._token_ok(query)
+        ok, from_query, how = self._token_ok(query)
         if not ok:
-            self._send(401, b"unauthorized", "text/plain; charset=utf-8")
+            self._send(401, unauthorized_page(how))
             return
         if from_query:
             # Redirect so the token stops riding in the URL bar and in the
             # Referer of every outbound job link on the page.
             cookie = (
                 f"{COOKIE}={os.environ['DASHBOARD_TOKEN']}; Path=/; HttpOnly; "
-                "SameSite=Lax; Secure; Max-Age=31536000"
+                "SameSite=Lax; Max-Age=31536000"
+                + ("; Secure" if self._is_https() else "")
             )
             self._send(302, b"", "text/plain",
                        [("Location", "/"), ("Set-Cookie", cookie)])

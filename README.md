@@ -34,6 +34,10 @@ fly deploy
 fly logs
 ```
 
+The volume region must match `primary_region` in `fly.toml` — a machine cannot
+mount a volume in another region. Both say `bom`; change them together or not
+at all, and never after the volume holds a corpus.
+
 Roughly $2/month for a shared-cpu-1x machine plus a 1GB volume.
 
 The machine serves the corpus dashboard on its public hostname. Open

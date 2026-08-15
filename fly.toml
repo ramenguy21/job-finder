@@ -1,7 +1,18 @@
 app = "gigbot"
-# Amsterdam. The volume is pinned to this region - changing it strands the
-# database. Any region works for the app itself, it's outbound-only.
-primary_region = "ams"
+# Mumbai. This said "ams" while README.md told you to create the volume in
+# "bom" - a machine cannot mount a volume in another region, so following both
+# gets you a deploy that will not place. They agree now.
+#
+# bom over ams because the old justification ("any region works, it's
+# outbound-only") stopped being true when the dashboard started listening:
+# there is now an inbound page you load from Pakistan, and Mumbai is ~2000km
+# away against Amsterdam's ~6000km. Telegram is reachable from Indian
+# datacentres, so the ISP-filtering problem this deploy exists to solve is
+# still solved.
+#
+# Free to change ONLY because nothing has been deployed yet. Once a volume
+# holds a real corpus, this line is pinned - editing it strands the database.
+primary_region = "bom"
 
 [build]
 
