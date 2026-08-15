@@ -35,6 +35,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("gigbot")
 
+# httpx logs every request URL at INFO. The Telegram URL embeds the bot token,
+# so that wrote the token in plaintext into the Fly logs on every send. The
+# per-feed "[source] N entries" lines already cover what these were useful for.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 def load_dotenv(path: str = ".env") -> None:
     """Read .env into os.environ if it exists. Real env always wins.
 
@@ -104,6 +109,12 @@ CREATE INDEX IF NOT EXISTS idx_seen_ingested  ON seen(ingested_at);
 
 
 def db_connect() -> sqlite3.Connection:
+    # Log the resolved absolute path. A DB_PATH that misses the mounted volume
+    # is invisible otherwise: the app works perfectly, then loses everything on
+    # restart and re-bootstraps, which suppresses notifications rather than
+    # erroring. That happened on Fly - the volume was mounted at /data while
+    # the process wrote ./seen.db into the container rootfs.
+    log.info("database: %s", os.path.abspath(DB_PATH))
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     # Migration for databases created before geo tiers existed. CREATE TABLE
@@ -694,6 +705,19 @@ def main() -> None:
         if args.once:
             run_once(conn, client)
             return
+
+        # Boot ping. Without it a deployment where the credentials are missing
+        # is indistinguishable from a healthy one: send_telegram() logs and
+        # returns False, bootstrap suppresses notifications anyway, and the
+        # cycle summary reads "0 sent" in both cases. That happened on the
+        # first Fly deploy. This answers the project's one real unknown - does
+        # Telegram deliver from outside the ISP filtering - in ten seconds
+        # rather than after a cycle that may legitimately match nothing.
+        if send_telegram(client, "gigbot online"):
+            log.info("boot ping delivered")
+        else:
+            log.error("boot ping FAILED - notifications will not arrive")
+
         while True:
             try:
                 run_once(conn, client)

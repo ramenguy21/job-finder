@@ -1,10 +1,7 @@
-# fly.toml app configuration file generated for gigbot on 2026-08-15T07:03:20Z
-#
-# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
-#
-
-app = 'gigbot'
-primary_region = 'ams'
+app = "gigbot"
+# Amsterdam. The volume is pinned to this region - changing it strands the
+# database. Any region works for the app itself, it's outbound-only.
+primary_region = "ams"
 
 [build]
 
