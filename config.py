@@ -44,9 +44,40 @@ FEEDS = [
     ("remoteok", "https://remoteok.com/api", "json"),
     ("remotive", "https://remotive.com/api/remote-jobs", "json"),
 
-    # UNVERIFIED. Pakistani job boards may or may not expose RSS.
-    # Run `python verify_feeds.py` before enabling.
+    # Himalayas. The most useful source here: every job carries
+    # `timezoneRestrictions` as a list of UTC offsets, so eligibility for a
+    # UTC+5 candidate is a fact rather than an inference from prose. See
+    # parse_json_jobs() for how that is folded into the geo vocabulary.
+    ("himalayas", "https://himalayas.app/jobs/api?limit=100", "json"),
+
+    # Jobicy. Smaller, remote-only, carries a structured `jobGeo`.
+    ("jobicy", "https://jobicy.com/api/v2/remote-jobs?count=50", "json"),
+
+    # Hacker News "Ask HN: Who is hiring?" - one thread a month, 500-800
+    # top-level comments, each one a posting in a rigid pipe-delimited format
+    # the existing filters read natively. Remote-heavy and startup-heavy.
+    #
+    # The URL is a story SEARCH, not a thread: the thread id changes monthly.
+    # It must be search_by_date filtered to the `whoishiring` account -
+    # Algolia's relevance search returns the 2016 and 2020 threads first.
+    ("hn:whoishiring",
+     ("https://hn.algolia.com/api/v1/search_by_date"
+      "?tags=story,author_whoishiring&hitsPerPage=5"), "hn"),
+
+    # DEAD - measured, not assumed. Do not re-add without re-testing.
+    #   rozee.pk       403 on every path including the homepage. Bot
+    #                  protection, not a missing feed; no user-agent fixes it.
+    #   mustakbil.com  no RSS (404). Homepage loads, so scraping is the only
+    #                  route, against a page not built for it.
+    #   brightspyre    RSS endpoint 500s.
+    # Consequence: no Pakistani job board is reachable, which is why the
+    # pk_local tier stays empty. Telegram channels are the remaining option.
     # ("rozee", "https://www.rozee.pk/rss/jobs"),
+
+    # Arbeitnow returns 175 rows and was deliberately rejected: the feed is
+    # German-language and mostly on-site ("Werkstudent technische
+    # Dokumentation", remote: False). High volume, low signal.
+    # ("arbeitnow", "https://arbeitnow.com/api/job-board-api", "json"),
 ]
 
 # Minimum seconds between requests to the same host.
@@ -124,6 +155,14 @@ TITLE_BLOCK = TITLE_BLOCK_ROLE + TITLE_BLOCK_SENIORITY
 TITLE_ROLE = [
     "engineer", "engineering", "developer", "development", "programmer",
     "coder", "architect", "swe", "sde", "devops", "sre",
+    # Plurals are spelled out because _build()'s trailing (?![a-z0-9])
+    # lookaround makes "developer" fail against "Developers". Board titles are
+    # singular so this never surfaced, but Hacker News headers are routinely
+    # plural - "Wine, 3D Graphics, and General Open Source Developers" - and
+    # every one of them was being dropped at the TITLE_ROLE stage.
+    # Widening the lookaround to allow a trailing "s" was the alternative and
+    # is worse: it would make "sale" match "sales" in TITLE_BLOCK.
+    "engineers", "developers", "programmers", "architects",
     "backend", "back end", "frontend", "front end", "fullstack", "full stack",
     "software", "web developer", "webdev", "api", "platform", "infrastructure",
     "data engineer", "machine learning engineer", "ml engineer",
@@ -207,8 +246,26 @@ PK_LOCAL = [
 
 # Strong, explicit signals that a candidate in Pakistan is eligible.
 # Keep these phrases specific. Bare "remote" means nothing.
+# `worldwide` and `world wide` were removed after measuring them: between them
+# they promoted 46 of 649 corpus rows, and the term was never describing where
+# the candidate may live. It was company boilerplate -
+#
+#   "...impact millions of users worldwide"        (MapTiler, Remote in EUROPE)
+#   "...organizations in the U.S. and worldwide"   (Amwell)
+#   "...delivering AI services worldwide"          (Azumo, LATIN AMERICA x4)
+#
+# - which put four Latin-America-only roles and a Europe-only role at the very
+# top of the notification order once pk_eligible started leading TIER_ORDER.
+#
+# This is the `go` trap from the module docstring, not the `rs.` one: the word
+# boundaries worked correctly and matched the word that was actually written.
+# "worldwide" is simply ordinary marketing English as well as a region marker.
+# "anywhere in the world" survives because no company writes that about its
+# customers. The reliable eligibility signal now comes from Himalayas'
+# structured timezoneRestrictions instead of from prose - see timezone_marker()
+# in main.py.
 PK_ELIGIBLE = [
-    "anywhere in the world", "worldwide", "world wide", "globally remote",
+    "anywhere in the world", "globally remote",
     "fully remote, anywhere", "remote - anywhere", "any timezone",
     "any time zone", "location independent", "work from anywhere",
     "south asia", "apac", "asia pacific", "gmt+5", "utc+5",
@@ -232,15 +289,28 @@ GEO_BLOCKED = [
     "latam only", "latin america only",
     "eastern time zone only", "pacific time only", "est only", "pst only",
     "must be in a us timezone", "overlap with pacific time",
+    # Synthetic marker, not prose. parse_json_jobs() emits this when a board
+    # publishes a timezone whitelist that excludes UTC+5. Nothing in a real
+    # posting says "timezone restricted" - it exists so structured data can
+    # reach the geo classifier through the same vocabulary as everything else.
+    "timezone restricted",
 ]
 
 # Notification order, best first. This is the line to change.
 #
-# Note the tension: "pk_local" first surfaces Pakistani employers, which is
-# what you asked for, but those pay local rates. "pk_eligible" first surfaces
-# international postings that accept candidates in Pakistan, which is the
-# stronger financial path. Swap the first two entries to flip it.
-TIER_ORDER = ["pk_local", "pk_eligible", "unknown", "geo_blocked"]
+# pk_eligible leads deliberately. Two reasons, both measured:
+#
+#   1. Supply. Every Pakistani job board is unreachable (see FEEDS), so
+#      pk_local has no source feeding it and sits empty. Ordering a tier first
+#      does nothing when nothing lands in it.
+#   2. Pay. International postings that accept a candidate in Pakistan are the
+#      stronger financial path than local-market listings.
+#
+# Himalayas is what makes this tier trustworthy: its timezoneRestrictions
+# field turns "does this accept UTC+5" from a guess about prose into a fact.
+# If Telegram channels are added and pk_local starts filling up, swap the
+# first two entries back.
+TIER_ORDER = ["pk_eligible", "pk_local", "unknown", "geo_blocked"]
 
 # Set True once you trust the GEO_BLOCKED list. False demotes them to the
 # bottom instead of dropping them, so you can see what's being caught.

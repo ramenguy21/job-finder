@@ -101,11 +101,30 @@ CREATE TABLE IF NOT EXISTS seen (
     published   INTEGER,
     ingested_at INTEGER,
     notified    INTEGER DEFAULT 0,
-    geo_tier    TEXT
+    geo_tier    TEXT,
+    notify_state TEXT DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_seen_title_hash ON seen(title_hash);
 CREATE INDEX IF NOT EXISTS idx_seen_ingested  ON seen(ingested_at);
 """
+
+# notify_state values. The `notified` INTEGER it replaces conflated three
+# different situations - never attempted, deliberately held, and attempted and
+# failed - which is why a failed send could never be retried without also
+# re-firing the entire bootstrap.
+#
+#   pending   matched, inside the window, not yet attempted. Will be sent.
+#   sent      delivered to Telegram.
+#   skipped   deliberately never sending: filtered out, or older than
+#             MAX_AGE_DAYS at ingest. Kept in the corpus regardless.
+#   failed    attempted, send failed. Retried on the next cycle.
+#
+# `notified` is still written alongside it, because backtest.py reads that
+# column in eight places and its --replay flow depends on it.
+STATE_PENDING = "pending"
+STATE_SENT = "sent"
+STATE_SKIPPED = "skipped"
+STATE_FAILED = "failed"
 
 
 def db_connect() -> sqlite3.Connection:
@@ -124,7 +143,26 @@ def db_connect() -> sqlite3.Connection:
     if "geo_tier" not in cols:
         log.info("migrating: adding geo_tier column")
         conn.execute("ALTER TABLE seen ADD COLUMN geo_tier TEXT")
+    if "notify_state" not in cols:
+        log.info("migrating: adding notify_state column")
+        conn.execute("ALTER TABLE seen ADD COLUMN notify_state TEXT")
+        # Backfill conservatively. An existing notified=0 row is almost
+        # certainly a bootstrap row, and mapping those to 'pending' would fire
+        # the several-hundred-message flood that bootstrap existed to prevent -
+        # on the very first run after upgrading, with no way to stop it.
+        # 'skipped' preserves today's behaviour exactly; only rows ingested
+        # from here on are eligible to send.
+        conn.execute(
+            "UPDATE seen SET notify_state = CASE WHEN notified = 1 "
+            "THEN ? ELSE ? END",
+            (STATE_SENT, STATE_SKIPPED),
+        )
+    # Both indexes must be created after their column exists. That ordering
+    # bug already bit once with geo_tier.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_geo_tier ON seen(geo_tier)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_seen_notify_state ON seen(notify_state)"
+    )
     conn.commit()
     return conn
 
@@ -439,12 +477,51 @@ def normalize_location(loc: str) -> str:
     return loc
 
 
+# Pakistan is UTC+5. Boards that publish a timezone whitelist state
+# eligibility outright, which beats inferring it from marketing prose.
+PK_UTC_OFFSET = 5
+
+
+def timezone_marker(row: dict) -> str:
+    """Turn a board's UTC-offset whitelist into a geo vocabulary term.
+
+    Himalayas ships `timezoneRestrictions: [-10, -9, -8, -7, -6, -5, 14]` -
+    a list of the UTC offsets a candidate may sit in. That is a far better
+    signal than anything in the description, and it is the reason this source
+    was added.
+
+    Rather than teach classify_geo about structured fields, emit a phrase the
+    existing vocabularies already match. Same tactic as normalize_location():
+    one classifier, one vocabulary, no second code path to keep in sync.
+
+    An empty or missing list means the board published no restriction, which
+    is not the same as "open to everyone" - it returns "" and lets the prose
+    decide.
+    """
+    tz = row.get("timezoneRestrictions")
+    if not isinstance(tz, list) or not tz:
+        return ""
+    offsets = [t for t in tz if isinstance(t, (int, float))]
+    if not offsets:
+        return ""
+    # "utc+5" is already in PK_ELIGIBLE; "timezone restricted" was added to
+    # GEO_BLOCKED for the negative case.
+    return "utc+5" if PK_UTC_OFFSET in offsets else "timezone restricted"
+
+
 def parse_json_jobs(payload: bytes, source: str) -> list:
     """Adapter for boards that publish JSON instead of usable RSS.
 
-    Handles RemoteOK (bare list, first element is legal boilerplate) and
-    Remotive ({"jobs": [...]}). Both use different key names, so map onto
-    the same shape feedparser gives us.
+    Four shapes now, all mapped onto what feedparser gives us:
+
+      RemoteOK    bare list; first element is legal boilerplate, no position
+      Remotive    {"jobs": [...]}, snake_case
+      Himalayas   {"jobs": [...]}, camelCase, structured geo + timezone
+      Jobicy      {"jobs": [...]}, camelCase with a `job` prefix on everything
+
+    The key fallbacks below look repetitive and are load-bearing: a missed key
+    name does not raise, it silently yields zero entries, which reads exactly
+    like a dead feed. `verify_feeds.py` is how you catch that.
     """
     try:
         data = json.loads(payload)
@@ -453,7 +530,7 @@ def parse_json_jobs(payload: bytes, source: str) -> list:
         return []
 
     if isinstance(data, dict):
-        rows = data.get("jobs") or data.get("results") or []
+        rows = data.get("jobs") or data.get("results") or data.get("data") or []
     else:
         rows = data
 
@@ -462,25 +539,66 @@ def parse_json_jobs(payload: bytes, source: str) -> list:
         if not isinstance(row, dict):
             continue
         # RemoteOK's first element is a legal notice with no position/url.
-        url = row.get("url") or row.get("apply_url") or ""
-        title = row.get("position") or row.get("title") or ""
+        url = (
+            row.get("url")
+            or row.get("apply_url")
+            or row.get("applicationLink")   # himalayas
+            or row.get("jobUrl")            # ashby, if ever enabled
+            or row.get("absolute_url")      # greenhouse, if ever enabled
+            or ""
+        )
+        title = (
+            row.get("position")
+            or row.get("title")
+            or row.get("jobTitle")          # jobicy
+            or ""
+        )
         if not title or not url:
             continue
 
-        company = row.get("company") or row.get("company_name") or ""
-        body = row.get("description") or row.get("summary") or ""
-        tags = row.get("tags") or []
-        location = normalize_location(
-            row.get("location") or row.get("candidate_required_location") or ""
+        company = (
+            row.get("company")
+            or row.get("company_name")
+            or row.get("companyName")       # himalayas, jobicy
+            or ""
         )
+        body = (
+            row.get("description")
+            or row.get("jobDescription")    # jobicy
+            or row.get("descriptionPlain")  # ashby
+            or row.get("summary")
+            or row.get("excerpt")           # himalayas
+            or ""
+        )
+        tags = row.get("tags") or row.get("categories") or []
+
+        # locationRestrictions is a list on Himalayas, a bare string elsewhere.
+        raw_loc = (
+            row.get("location")
+            or row.get("candidate_required_location")
+            or row.get("locationRestrictions")
+            or row.get("jobGeo")            # jobicy
+            or ""
+        )
+        if isinstance(raw_loc, list):
+            raw_loc = ", ".join(str(x) for x in raw_loc)
+        location = normalize_location(raw_loc)
 
         entries.append(
             {
-                "id": str(row.get("id") or url),
+                "id": str(row.get("id") or row.get("guid") or url),
                 "title": f"{company}: {title}" if company else title,
-                # Fold tags and location into the body so the keyword and geo
-                # filters can see them. This is where "Worldwide" lives.
-                "summary": f"{body} {' '.join(map(str, tags))} {location}",
+                # Fold tags, location and the timezone verdict into the body so
+                # the keyword and geo filters can see them. This is where
+                # "Worldwide" lives.
+                "summary": " ".join(
+                    filter(None, [
+                        str(body),
+                        " ".join(map(str, tags)),
+                        location,
+                        timezone_marker(row),
+                    ])
+                ),
                 "link": url,
                 "published_parsed": None,
                 "_epoch": (
@@ -488,13 +606,101 @@ def parse_json_jobs(payload: bytes, source: str) -> list:
                     or row.get("publication_date")
                     or row.get("date")
                     or row.get("created_at")
+                    or row.get("pubDate")   # himalayas (epoch), jobicy (ISO)
                 ),
             }
         )
     return entries
 
 
+HN_ITEM_URL = "https://hn.algolia.com/api/v1/items/{}"
+HN_COMMENT_URL = "https://news.ycombinator.com/item?id={}"
+
+
+def fetch_hn_thread(client: httpx.Client, source: str, search_url: str) -> list:
+    """Hacker News "Who is hiring?" - the monthly thread, as feed entries.
+
+    Two requests, because the thread id changes every month: find the newest
+    thread, then pull its comments. Each top-level comment is one posting, in
+    a format the existing filters read without special-casing:
+
+        Acme Corp | Berlin or REMOTE (worldwide) | Full-time |
+        Go, Postgres, Kubernetes | https://acme.com/jobs
+
+    Two traps, both hit while building this:
+
+    1. Algolia's default `search` endpoint ranks by relevance and returns the
+       2016 and 2020 threads first. It must be `search_by_date` filtered to
+       the `whoishiring` account, which is what posts them.
+    2. The same account posts "Who wants to be hired?" and the freelancer
+       thread in the same hour. Those are candidates advertising themselves,
+       not employers, so the title check below excludes them explicitly.
+
+    Comment `text` is HTML with entities (`&#x27;`, `&#x2F;`). Paragraphs are
+    split on a literal <p>, so the header line has to be taken before tags are
+    stripped or the whole posting collapses into one run-on title.
+    """
+    payload = http_get(client, search_url, source)
+    if payload is None:
+        return []
+    try:
+        data = json.loads(payload)
+    except ValueError as exc:
+        log.error("[%s] story search parse failed: %s", source, exc)
+        return []
+
+    story = None
+    for hit in data.get("hits", []):
+        title = (hit.get("title") or "").lower()
+        if "who is hiring" in title and "wants to be hired" not in title:
+            story = hit
+            break
+    if story is None:
+        log.error("[%s] no 'who is hiring' thread in search results", source)
+        return []
+
+    story_id = story.get("objectID")
+    log.info("[%s] thread %s: %s", source, story_id, story.get("title"))
+
+    payload = http_get(client, HN_ITEM_URL.format(story_id), source)
+    if payload is None:
+        return []
+    try:
+        item = json.loads(payload)
+    except ValueError as exc:
+        log.error("[%s] thread parse failed: %s", source, exc)
+        return []
+
+    entries = []
+    for child in item.get("children") or []:
+        text = child.get("text") or ""
+        if not text:
+            continue  # deleted or dead comment
+        header = strip_html(html.unescape(text.split("<p>")[0]))
+        if not header:
+            continue
+        entries.append(
+            {
+                "id": f"hn:{child.get('id')}",
+                # The pipe-delimited header is the title. Capped because some
+                # posters put the whole job spec on one line and the Telegram
+                # message becomes unreadable.
+                "title": header[:200],
+                "summary": strip_html(html.unescape(text)),
+                "link": HN_COMMENT_URL.format(child.get("id")),
+                "published_parsed": None,
+                # Comments accumulate over the month, so MAX_AGE_DAYS trims
+                # this to the last week on its own.
+                "_epoch": child.get("created_at_i"),
+            }
+        )
+    return entries
+
+
 def fetch_feed(client: httpx.Client, source: str, url: str, kind: str) -> list:
+    if kind == "hn":
+        return fetch_hn_thread(client, source, url)
+
     payload = http_get(client, url, source)
     if payload is None:
         return []
@@ -520,27 +726,28 @@ def fetch_feed(client: httpx.Client, source: str, url: str, kind: str) -> list:
 def run_once(conn: sqlite3.Connection, client: httpx.Client) -> None:
     """One full pipeline pass: ingest everything, then notify the best of it.
 
-    KNOWN GAP - a send that fails is not retried. Phase 1 skips any entry_id
-    already in `seen`, so an item whose send failed keeps notified=0 but is
-    never reconsidered on a later cycle. It survives in the corpus and
-    `backtest.py --replay` will pick it up, but nothing automatic will.
+    Phase 1 ingests and records a decision per entry in notify_state. Phase 2
+    then queries the DB for everything still pending, not just what arrived
+    this cycle. That distinction is the whole point: it makes the feed a
+    rolling MAX_AGE_DAYS window rather than a new-since-last-cycle diff.
 
-    The obvious fix - re-queue rows with notified=0 - is wrong as the schema
-    stands, because bootstrap rows are also notified=0 and re-queueing them
-    would fire the ~400-message flood that bootstrap exists to prevent.
-    Doing it properly needs a third state (a notify_state column:
-    pending/sent/skipped) so "never attempted" and "attempted and failed" stop
-    sharing a value. Until then the circuit breaker below at least keeps a
-    dead channel from burning 25 minutes a cycle.
+    Three consequences worth knowing:
+
+    - A send that fails is marked 'failed' and retried next cycle. It used to
+      keep notified=0 and be lost, because phase 1 skips any entry_id already
+      in `seen` and nothing reconsidered it.
+    - Overflow past MAX_NOTIFY_PER_CYCLE stays 'pending' and drains on later
+      cycles instead of being marked notified=1 without ever being sent.
+    - Bootstrap suppression is gone. It existed because a first run would fire
+      several hundred messages at once, but that was a symptom of having no
+      queue: with a per-cycle cap and a draining backlog, a fresh database now
+      sends the best MAX_NOTIFY_PER_CYCLE of the last MAX_AGE_DAYS and works
+      through the rest at POLL_INTERVAL. Expect the first few cycles after a
+      volume reset to be busy - that is the backlog delivering, not a bug.
     """
-    bootstrap = conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0] == 0
-    if bootstrap:
-        log.info("empty database, bootstrapping without notifications")
-
     age_cutoff = int(time.time()) - config.MAX_AGE_DAYS * 86400
     stats = {"new": 0, "matched": 0, "dupe": 0, "dropped": 0, "sent": 0,
              "failed": 0}
-    pending = []
 
     # -- phase 1: ingest everything, collect candidates --------------------
     for feed in config.FEEDS:
@@ -571,51 +778,80 @@ def run_once(conn: sqlite3.Connection, client: httpx.Client) -> None:
 
             stats["new"] += 1
 
-            # Insert first, always. The corpus is worth keeping even for
-            # entries that never get notified.
+            # Decide now whether this will ever be sent, and record it. The
+            # alternative - deciding at send time - is what made a failed send
+            # indistinguishable from a filtered one.
+            if published < age_cutoff:
+                state = STATE_SKIPPED
+            else:
+                keep, why = match_reason(title, body)
+                if not keep:
+                    log.debug("[%s] skip %r - %s", source, title[:60], why)
+                    state = STATE_SKIPPED
+                elif tier == "geo_blocked" and config.DROP_GEO_BLOCKED:
+                    stats["dropped"] += 1
+                    state = STATE_SKIPPED
+                else:
+                    stats["matched"] += 1
+                    state = STATE_PENDING
+
+            # Insert regardless of that decision. The corpus is worth keeping
+            # even for entries that will never be notified.
             conn.execute(
                 "INSERT OR IGNORE INTO seen "
                 "(entry_id, title_hash, source, title, body, link, published, "
-                " ingested_at, notified, geo_tier) "
-                "VALUES (?,?,?,?,?,?,?,?,0,?)",
+                " ingested_at, notified, geo_tier, notify_state) "
+                "VALUES (?,?,?,?,?,?,?,?,0,?,?)",
                 (entry_id, thash, source, title, body, link, published,
-                 int(time.time()), tier),
-            )
-
-            if bootstrap:
-                continue
-            if published < age_cutoff:
-                continue
-            keep, why = match_reason(title, body)
-            if not keep:
-                log.debug("[%s] skip %r - %s", source, title[:60], why)
-                continue
-
-            stats["matched"] += 1
-
-            if tier == "geo_blocked" and config.DROP_GEO_BLOCKED:
-                stats["dropped"] += 1
-                continue
-
-            cross = conn.execute(
-                "SELECT 1 FROM seen WHERE title_hash = ? AND notified = 1 LIMIT 1",
-                (thash,),
-            ).fetchone()
-            if cross:
-                stats["dupe"] += 1
-                continue
-
-            pending.append(
-                {
-                    "entry_id": entry_id, "title_hash": thash, "source": source,
-                    "title": title, "body": body, "link": link,
-                    "published": published, "tier": tier,
-                }
+                 int(time.time()), tier, state),
             )
 
         conn.commit()
 
-    # -- phase 2: sort by tier, then newest first, then send ---------------
+    # -- phase 2: drain the backlog, best first ----------------------------
+    #
+    # This queries the whole table, not just what phase 1 collected. Anything
+    # still pending inside the window is a candidate: this cycle's arrivals,
+    # last cycle's overflow, and previous failures. That is what makes the
+    # window rolling rather than incremental.
+    queued = conn.execute(
+        "SELECT entry_id, title_hash, source, title, body, link, published, "
+        "       geo_tier "
+        "FROM seen WHERE notify_state IN (?, ?) AND published >= ?",
+        (STATE_PENDING, STATE_FAILED, age_cutoff),
+    ).fetchall()
+
+    pending = [
+        {
+            "entry_id": r[0], "title_hash": r[1], "source": r[2],
+            "title": r[3], "body": r[4], "link": r[5],
+            "published": r[6], "tier": r[7] or "unknown",
+        }
+        for r in queued
+    ]
+
+    # Cross-feed duplicates: the same job on WWR and RemoteOK. Checked against
+    # what has actually been sent, so a title already delivered days ago does
+    # not come round again via a second source.
+    already_sent = {
+        r[0] for r in conn.execute(
+            "SELECT DISTINCT title_hash FROM seen WHERE notify_state = ?",
+            (STATE_SENT,),
+        )
+    }
+    deduped = []
+    for item in pending:
+        if item["title_hash"] in already_sent:
+            stats["dupe"] += 1
+            conn.execute(
+                "UPDATE seen SET notify_state = ?, notified = 1 "
+                "WHERE entry_id = ?",
+                (STATE_SKIPPED, item["entry_id"]),
+            )
+            continue
+        deduped.append(item)
+    pending = deduped
+
     rank = {tier: i for i, tier in enumerate(config.TIER_ORDER)}
     pending.sort(key=lambda p: (rank.get(p["tier"], 99), -p["published"]))
 
@@ -625,10 +861,15 @@ def run_once(conn: sqlite3.Connection, client: httpx.Client) -> None:
     sent_hashes: set[str] = set()
     consecutive_failures = 0
     for item in pending:
-        # Two feeds in the same cycle can carry the same job; the DB check in
-        # phase 1 can't catch that because nothing was marked notified yet.
+        # Two feeds in the same cycle can carry the same job; the query above
+        # can't catch that because neither copy has been sent yet.
         if item["title_hash"] in sent_hashes:
             stats["dupe"] += 1
+            conn.execute(
+                "UPDATE seen SET notify_state = ?, notified = 1 "
+                "WHERE entry_id = ?",
+                (STATE_SKIPPED, item["entry_id"]),
+            )
             continue
 
         # Circuit breaker. A blocked or down Telegram costs ~60s per message
@@ -652,15 +893,20 @@ def run_once(conn: sqlite3.Connection, client: httpx.Client) -> None:
         if send_telegram(client, msg):
             consecutive_failures = 0
             conn.execute(
-                "UPDATE seen SET notified = 1 WHERE entry_id = ?",
-                (item["entry_id"],),
+                "UPDATE seen SET notify_state = ?, notified = 1 "
+                "WHERE entry_id = ?",
+                (STATE_SENT, item["entry_id"]),
             )
             sent_hashes.add(item["title_hash"])
             stats["sent"] += 1
             time.sleep(0.5)  # stay well under Telegram's rate limit
         else:
-            # Stays notified=0. See the note in the docstring of run_once
-            # about why that is not yet a durable retry.
+            # Marked 'failed', not left ambiguous: the next cycle picks it up
+            # again. notified stays 0 so backtest.py --replay still sees it.
+            conn.execute(
+                "UPDATE seen SET notify_state = ? WHERE entry_id = ?",
+                (STATE_FAILED, item["entry_id"]),
+            )
             consecutive_failures += 1
             stats["failed"] += 1
 
@@ -671,25 +917,21 @@ def run_once(conn: sqlite3.Connection, client: httpx.Client) -> None:
         breakdown = ", ".join(
             f"{n} {TIER_LABEL.get(t, t)}" for t, n in sorted(by_tier.items())
         )
+        # Overflow keeps notify_state='pending' and is deliberately NOT
+        # touched here. It drains on the next cycle, in tier order, which is
+        # the difference between a rolling window and a backlog you could only
+        # ever reach with a SELECT.
         send_telegram(
             client,
-            f"<i>+{len(overflow)} more matches held back this cycle "
-            f"({html.escape(breakdown)}). Query the DB or loosen EXCLUDE.</i>",
+            f"<i>+{len(overflow)} more queued "
+            f"({html.escape(breakdown)}), sending next cycle.</i>",
         )
-        # Held-back items stay notified=0, so they're queryable but won't be
-        # re-sent next cycle. That's deliberate: a backlog you never clear is
-        # worse than a backlog you can SELECT.
-        for item in overflow:
-            conn.execute(
-                "UPDATE seen SET notified = 1 WHERE entry_id = ?",
-                (item["entry_id"],),
-            )
 
     conn.commit()
     prune(conn)
     log.info(
         "cycle done: %d new, %d matched, %d dupes, %d geo-dropped, "
-        "%d sent, %d failed, %d held",
+        "%d sent, %d failed, %d queued",
         stats["new"], stats["matched"], stats["dupe"], stats["dropped"],
         stats["sent"], stats["failed"], len(overflow),
     )
