@@ -6,9 +6,9 @@
     uv run python dashboard.py --serve    # http://localhost:8080 instead
 
 On Fly the watcher serves this itself - see serve_in_background(), which
-main.py starts on a daemon thread when DASHBOARD_PORT is set. Reaching it
-needs DASHBOARD_TOKEN; without one the server answers 503 rather than
-publishing the corpus to a guessable *.fly.dev hostname.
+main.py starts on a daemon thread when DASHBOARD_PORT is set. There is no auth:
+anyone with the hostname can read the corpus. That is a deliberate call for a
+personal watcher over public job feeds.
 
 This is `backtest.py` with a browser instead of a terminal. Same idea, same
 source of truth: every verdict shown is recomputed live from `config.py` via
@@ -31,7 +31,6 @@ no network access at all.
 from __future__ import annotations
 
 import argparse
-import hmac
 import json
 import logging
 import os
@@ -42,7 +41,6 @@ import time
 import webbrowser
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
 
 import config
 import main as gb
@@ -854,61 +852,16 @@ def rendered_page(db_path: str) -> bytes:
         return _cache["body"]  # type: ignore[return-value]
 
 
-COOKIE = "gigbot_dash"
-
-LOCKED_PAGE = b"""<!doctype html><meta charset="utf-8">
-<title>gigbot</title>
-<body style="font:15px/1.6 system-ui,sans-serif;max-width:34em;margin:14vh auto;padding:0 6vw">
-<h1 style="font-size:17px">Dashboard is locked</h1>
-<p>No <code>DASHBOARD_TOKEN</code> is set, so this corpus is not being served.
-The hostname is public and guessable, so the server fails closed rather than
-open.</p>
-<pre style="background:#f2f2ef;padding:10px 12px;border-radius:8px;overflow-x:auto"
->fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)</pre>
-<p>Then open <code>https://&lt;app&gt;.fly.dev/?t=&lt;token&gt;</code> once; it sets a
-cookie and the bare URL works from then on.</p>
-</body>"""
-
-# What the 401 actually says, per way the credential arrived. The previous
-# version was the single word "unauthorized", which is true and useless: it
-# cannot tell "you opened the bare URL and have never presented a token" apart
-# from "your cookie is left over from a token you rotated", and the fixes
-# differ.
-_401_CAUSE = {
-    "none": "You have not presented a token. The bare URL only works after a "
-            "visit with <code>?t=</code> has set the cookie.",
-    "query": "The token in the URL does not match <code>DASHBOARD_TOKEN</code> "
-             "on the server. Check for a truncated paste, a stale value, or a "
-             "shell that expanded the command substitution differently than "
-             "you expected - <code>fly secrets list</code> shows when it was "
-             "last set, and <code>fly logs</code> shows the server restarting "
-             "after it changed.",
-    "cookie": "Your cookie does not match the current <code>DASHBOARD_TOKEN</code>. "
-              "That is what a rotated token looks like. Visit with "
-              "<code>?t=&lt;new-token&gt;</code> again to replace it.",
-    "bearer": "The <code>Authorization: Bearer</code> value does not match "
-              "<code>DASHBOARD_TOKEN</code>.",
-}
-
-
-def unauthorized_page(how: str) -> bytes:
-    return (
-        """<!doctype html><meta charset="utf-8">
-<title>gigbot</title>
-<body style="font:15px/1.6 system-ui,sans-serif;max-width:34em;margin:14vh auto;padding:0 6vw">
-<h1 style="font-size:17px">Unauthorized</h1>
-<p>""" + _401_CAUSE.get(how, _401_CAUSE["none"]) + """</p>
-<p>Open <code>/?t=&lt;token&gt;</code> once. It redirects to <code>/</code> and sets a
-cookie, so the token stops riding in the URL bar.</p>
-<p style="color:#666">Setting a token with a <code>+</code> or <code>=</code> in it
-is fine - both spellings are accepted - but <code>openssl rand -hex 24</code>
-avoids the question entirely.</p>
-</body>"""
-    ).encode("utf-8")
-
-
 class Handler(BaseHTTPRequestHandler):
-    """Two routes and a token. Anything more belongs in a different project."""
+    """Two routes, no auth. Anyone who reaches the port sees the corpus.
+
+    There was a token gate here and it was removed deliberately: this is a
+    personal watcher over public job feeds, and the page is a read-only view of
+    postings that were already published somewhere else. The tradeoff is that
+    the Fly hostname is all it takes, and *.fly.dev names are enumerable - if
+    that stops being acceptable, put it behind `fly proxy` and drop
+    [http_service] rather than reinventing a login here.
+    """
 
     server_version = "gigbot"
     protocol_version = "HTTP/1.1"
@@ -924,8 +877,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        # The page embeds every posting in the corpus. Keep it out of indexes
-        # and caches even though a token is required to see it.
+        # Nothing gates the page, so this header is the only thing keeping the
+        # corpus out of search results. Cheap, and worth keeping.
         self.send_header("X-Robots-Tag", "noindex, nofollow")
         self.send_header("Cache-Control", "no-store, private")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -935,82 +888,15 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _token_ok(self, query: str) -> tuple[bool, bool, str]:
-        """(authorised, came_from_query, how_it_was_presented).
-
-        The third value exists only so the 401 page can tell you *which* thing
-        is wrong. A bare "unauthorized" cannot distinguish "you never presented
-        a token" from "your cookie is from a token you have since rotated", and
-        those have different fixes.
-        """
-        want = os.environ.get("DASHBOARD_TOKEN", "")
-        if not want:
-            return False, False, "none"
-
-        # Both spellings of the query value. parse_qs applies form decoding, so
-        # a "+" in the token arrives as a space and "=" padding is eaten - which
-        # silently 401s every base64 token while hex ones work. Comparing the
-        # raw value too costs nothing and removes the whole class of mystery.
-        decoded = parse_qs(query).get("t", [""])[0]
-        raw = ""
-        for pair in query.split("&"):
-            key, _, val = pair.partition("=")
-            if key == "t":
-                raw = val
-                break
-        if decoded or raw:
-            ok = (hmac.compare_digest(decoded, want)
-                  or hmac.compare_digest(raw, want))
-            return ok, True, "query"
-
-        auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            return hmac.compare_digest(auth[7:], want), False, "bearer"
-        for part in (self.headers.get("Cookie") or "").split(";"):
-            name, _, val = part.strip().partition("=")
-            if name == COOKIE:
-                return hmac.compare_digest(val, want), False, "cookie"
-        return False, False, "none"
-
-    def _is_https(self) -> bool:
-        """Whether the *browser* reached us over TLS.
-
-        Fly terminates TLS at the edge and forwards plain HTTP to the machine,
-        so the socket is never TLS and X-Forwarded-Proto is the only truth
-        available. This decides the cookie's Secure flag: mandatory on Fly,
-        and fatal on a plain-http localhost, where Safari drops a Secure cookie
-        outright and every reload after the redirect comes back 401.
-        """
-        return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
-
     def do_GET(self) -> None:
-        path, _, query = self.path.partition("?")
+        path, _, _query = self.path.partition("?")
 
-        # Unauthenticated on purpose: it reveals nothing and Fly may probe it.
+        # Kept separate from / so a health probe never pays for a render.
         if path == "/healthz":
             self._send(200, b"ok", "text/plain; charset=utf-8")
             return
         if path not in ("/", "/index.html"):
             self._send(404, b"not found", "text/plain; charset=utf-8")
-            return
-        if not os.environ.get("DASHBOARD_TOKEN"):
-            self._send(503, LOCKED_PAGE)
-            return
-
-        ok, from_query, how = self._token_ok(query)
-        if not ok:
-            self._send(401, unauthorized_page(how))
-            return
-        if from_query:
-            # Redirect so the token stops riding in the URL bar and in the
-            # Referer of every outbound job link on the page.
-            cookie = (
-                f"{COOKIE}={os.environ['DASHBOARD_TOKEN']}; Path=/; HttpOnly; "
-                "SameSite=Lax; Max-Age=31536000"
-                + ("; Secure" if self._is_https() else "")
-            )
-            self._send(302, b"", "text/plain",
-                       [("Location", "/"), ("Set-Cookie", cookie)])
             return
 
         try:
@@ -1044,13 +930,7 @@ def serve_in_background(port: int, db_path: str) -> ThreadingHTTPServer:
     httpd.daemon_threads = True
     threading.Thread(target=httpd.serve_forever, daemon=True,
                      name="dashboard").start()
-    if os.environ.get("DASHBOARD_TOKEN"):
-        log.info("dashboard listening on :%d", port)
-    else:
-        log.warning(
-            "dashboard listening on :%d but DASHBOARD_TOKEN is unset - it will "
-            "serve 503 until you set one", port
-        )
+    log.info("dashboard listening on :%d", port)
     return httpd
 
 
@@ -1071,8 +951,6 @@ def run() -> None:
                             format="%(asctime)s %(levelname)s %(message)s")
         serve_in_background(args.port, args.db)
         url = f"http://localhost:{args.port}/"
-        if os.environ.get("DASHBOARD_TOKEN"):
-            url += f"?t={os.environ['DASHBOARD_TOKEN']}"
         print(f"serving {url}  (ctrl-c to stop)")
         if args.open_it:
             webbrowser.open(url)

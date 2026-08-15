@@ -29,7 +29,6 @@ hundred messages at once. Run it twice to see real behaviour.
 fly launch --no-deploy --copy-config   # pick a unique app name
 fly volumes create gigbot_data --size 1 --region bom
 fly secrets set TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...
-fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)
 fly deploy
 fly logs
 ```
@@ -40,10 +39,11 @@ at all, and never after the volume holds a corpus.
 
 Roughly $2/month for a shared-cpu-1x machine plus a 1GB volume.
 
-The machine serves the corpus dashboard on its public hostname. Open
-`https://<app>.fly.dev/?t=<DASHBOARD_TOKEN>` once — that sets a cookie, and the
-bare URL works afterwards. Without the secret the server answers 503 rather
-than publishing every posting it has collected to a guessable hostname.
+The machine serves the corpus dashboard at `https://<app>.fly.dev/`. There is
+no login on it — anyone with the hostname can read every posting collected. For
+a personal watcher over public job feeds that is a reasonable trade; if it
+isn't yours, delete `[http_service]` from `fly.toml` and use
+`fly proxy 8080:8080` instead.
 
 Keep `auto_stop_machines = 'off'` in `fly.toml`. This is a poll loop, not a web
 app: if Fly stops the machine because nobody is loading the dashboard, it stops

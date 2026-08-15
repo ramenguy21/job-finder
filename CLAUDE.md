@@ -23,7 +23,7 @@ uv run python dashboard.py --serve    # ...over HTTP instead, like Fly does
 ```
 
 Env: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `DB_PATH`, `POLL_INTERVAL`,
-`DASHBOARD_PORT`, `DASHBOARD_TOKEN`.
+`DASHBOARD_PORT`.
 `main.py` loads `.env` at import via `load_dotenv()`; real environment
 variables take precedence, so Fly is unaffected. Without a token,
 `send_telegram()` logs instead of sending — that is a valid local-dev path,
@@ -70,8 +70,8 @@ before any filtering. The corpus has value independent of notifications.
 recomputes every verdict from `config.py` rather than reading the stored
 `geo_tier` / `notify_state` — editing a vocabulary and reloading shows the
 effect. It must never migrate, reclassify or prune; `backtest.py --reclassify`
-stays the only writer. It also serves nothing without `DASHBOARD_TOKEN`: the
-Fly hostname is public and the page embeds the whole corpus.
+stays the only writer. It has no auth by choice: on Fly the hostname is the
+only thing gating it.
 
 **Keep dedupe conservative.** `title_hash` strips bracketed tags only.
 Aggressive normalization drops real leads.

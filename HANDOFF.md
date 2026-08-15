@@ -248,16 +248,25 @@ What it answers that the terminal did not:
   `STACK` edit.
 
 On Fly, `main.py` starts it on a daemon thread when `DASHBOARD_PORT` is set,
-and `[http_service]` routes to it. Two things guard it:
+and `[http_service]` routes to it.
 
-- **`DASHBOARD_TOKEN` or nothing.** No token, no page — 503, not an open door.
-  `fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)`, then hit
-  `/?t=<token>` once to set a cookie. The hostname is public and guessable and
-  the page embeds every posting in the corpus.
+**There is no auth.** A token gate was built and then deliberately removed —
+this is a personal watcher over public job feeds, and the page is a read-only
+view of postings already published elsewhere. The cost is real and worth
+stating once: `https://<app>.fly.dev/` serves the entire corpus to anyone who
+asks, and `*.fly.dev` hostnames are enumerable. An `X-Robots-Tag: noindex`
+header keeps it out of search results, which is the only thing left protecting
+it. If that stops being acceptable, delete `[http_service]` from `fly.toml` and
+reach it with `fly proxy 8080:8080` — nothing in the code needs to change.
+
+What does still guard the *watcher* from the dashboard:
+
 - **Read-only, cached, daemon thread.** It opens SQLite with `mode=ro`, caches
   the rendered body for 120s or until the DB file changes, and cannot keep the
   process alive. A render is ~2s of regex over the whole corpus; without the
   cache, a held refresh key would pin the one shared CPU the watcher runs on.
+- A render failure returns 500 and is logged. A viewer must never be able to
+  take the poll loop down with it.
 
 ---
 
@@ -265,8 +274,8 @@ and `[http_service]` routes to it. Two things guard it:
 
 1. Deploy to Fly and confirm Telegram delivers from there. Everything else is
    downstream of that one unknown. Confirm the dashboard answers on
-   `https://gigbot.fly.dev/?t=<token>` in the same pass — it is the fastest
-   check that the volume mounted and the corpus is where it should be.
+   `https://<app>.fly.dev/` in the same pass — it is the fastest check that the
+   volume mounted and the corpus is where it should be.
 2. `--replay` the backlog once delivery is confirmed.
 3. Watch `fly logs` for a day.
 4. Decide on Reddit: PRAW/OAuth, or drop the nine feeds and lean on WWR +

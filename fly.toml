@@ -27,14 +27,12 @@ primary_region = "bom"
   source = 'gigbot_data'
   destination = '/data'
 
-# The dashboard is the only thing that listens. Reaching it needs
-# DASHBOARD_TOKEN, which is a secret, not an env var:
-#
-#   fly secrets set DASHBOARD_TOKEN=$(openssl rand -hex 24)
-#   open https://gigbot.fly.dev/?t=<token>     # sets a cookie, then / works
-#
-# Without the secret the server answers 503 rather than publishing every
-# posting in the corpus on a guessable hostname.
+# The dashboard is the only thing that listens, and it is unauthenticated:
+# https://<app>.fly.dev/ serves the whole corpus to anyone who asks. That is a
+# deliberate call - public job postings, personal watcher - but it does mean
+# the hostname is the only thing standing between the corpus and the internet.
+# If that changes, delete this whole block and reach it with
+# `fly proxy 8080:8080` instead; nothing else needs to change.
 [http_service]
   internal_port = 8080
   force_https = true
